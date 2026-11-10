@@ -118,6 +118,7 @@ class VideoStream(
             } else {
                 surface.setFrameRate(fps.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
             }
+            Log.i(TAG, "requested ${fps}fps on the surface")
         }.onFailure { Log.w(TAG, "setFrameRate failed: ${it.message}") }
     }
 
@@ -204,15 +205,11 @@ class VideoStream(
         stamps.clear()
         lastRenderedNs = 0L
 
-        // The operating-rate hint helps latency but some decoders refuse to
-        // start with it at high size and rate combinations (the Exynos one does
-        // at 2560x1600@90), so fall back to plain realtime priority.
-        val codec = try {
-            configureCodec(header, target, operatingRate = true)
-        } catch (e: MediaCodec.CodecException) {
-            Log.w(TAG, "decoder refused the operating-rate hint ($e); retrying without it")
-            configureCodec(header, target, operatingRate = false)
-        }
+        // Decoders disagree about which optional keys they accept, and the
+        // disagreement is not limited to the operating rate. Walk down the list
+        // from most to least tuned, and keep the first configuration that
+        // starts: the tuning is a latency bonus, not a requirement.
+        val codec = startFirstAcceptedCodec(header, target)
         this.codec = codec
         startAckWriter(output)
 
@@ -255,28 +252,97 @@ class VideoStream(
         }
     }
 
+    /**
+     * Optional `MediaFormat` keys, ordered from most to least aggressive.
+     *
+     * The advanced tiers carry vendor extensions. They are widely described as
+     * being ignored by decoders that do not know them, and on Qualcomm and
+     * Exynos parts that holds — but it is not a rule OMX enforces. Kirin's
+     * `OMX.hisi.video.decoder.avc` returns a bare `0x80001001` from
+     * `native_configure` when it sees a vendor key it does not implement, so
+     * an unknown key is a hard failure there, not a no-op. Tuning therefore has
+     * to be offered tentatively, and withdrawn if the decoder refuses it.
+     */
+    private enum class CodecTuning {
+        /** Everything: vendor low-latency extensions, `KEY_LOW_LATENCY`, priority, operating rate. */
+        FULL,
+
+        /** Drops the vendor extensions, keeping the standard low-latency key. */
+        NO_VENDOR_EXTENSIONS,
+
+        /** Also drops `KEY_LOW_LATENCY`, keeping priority and the operating rate. */
+        NO_LOW_LATENCY,
+
+        /** Also drops the operating-rate hint, keeping realtime priority. */
+        NO_OPERATING_RATE,
+
+        /** Nothing but mime, size and surface. The floor that must always work. */
+        MINIMAL,
+    }
+
+    /**
+     * Configure and start a decoder, stepping down through [CodecTuning] until
+     * one is accepted.
+     *
+     * A `CodecException` from `native_configure` leaves nothing usable behind,
+     * so each attempt builds its own decoder on a fresh `MediaFormat`. The
+     * tier that succeeded is logged: it names the key the device rejects.
+     */
+    private fun startFirstAcceptedCodec(
+        header: Protocol.StreamHeader,
+        target: Surface,
+    ): MediaCodec {
+        val tiers = CodecTuning.entries
+        for ((i, tier) in tiers.withIndex()) {
+            try {
+                return configureCodec(header, target, tier)
+            } catch (e: MediaCodec.CodecException) {
+                val last = i == tiers.lastIndex
+                if (last) throw e
+                Log.w(
+                    TAG,
+                    "decoder refused ${tier.name} tuning ($e); stepping down to " +
+                        "${tiers[i + 1].name}",
+                )
+            }
+        }
+        error("unreachable: the last tuning tier is rethrown")
+    }
+
     private fun configureCodec(
         header: Protocol.StreamHeader,
         target: Surface,
-        operatingRate: Boolean,
+        tuning: CodecTuning,
     ): MediaCodec {
         val format = MediaFormat.createVideoFormat(header.mime, header.width, header.height)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        val withVendor = tuning == CodecTuning.FULL
+        val withLowLatency = withVendor || tuning == CodecTuning.NO_VENDOR_EXTENSIONS
+        val withPriority = withLowLatency || tuning == CodecTuning.NO_LOW_LATENCY
+        val withOperatingRate = withPriority && tuning != CodecTuning.NO_OPERATING_RATE
+
+        // `KEY_LOW_LATENCY` arrived in API 30 and is honoured by c2 decoders.
+        // A legacy OMX decoder that predates it may reject the key outright
+        // rather than ignore it — Kirin's OMX.hisi decoder returns a bare
+        // 0x80001001 from native_configure for it, which is why it is given up
+        // before the standard-only keys below.
+        if (withLowLatency && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
         }
-        // This device exposes OMX.qcom decoders and declares no `low-latency`
-        // feature, so KEY_LOW_LATENCY may be ignored. The Qualcomm vendor
-        // extension is the fallback; unknown vendor keys are ignored rather
-        // than rejected, so setting it costs nothing.
-        runCatching { format.setInteger("vendor.qti-ext-dec-low-latency.enable", 1) }
-        // Samsung's Exynos decoders (c2.exynos.*) have their own spelling of the
-        // same switch, and ignore the Qualcomm one.
-        runCatching { format.setInteger("vendor.rtc-ext-dec-low-latency.enable", 1) }
-        // Real-time priority, and an operating rate so the codec sizes its
-        // pipeline for this frame rate instead of batching for throughput.
-        runCatching { format.setInteger(MediaFormat.KEY_PRIORITY, 0) }
-        if (operatingRate) {
+        if (withVendor) {
+            // Qualcomm's spelling of the same switch, then Exynos's. Decoders
+            // that do not implement one are expected to ignore it; not every
+            // OMX implementation does, so these go first.
+            format.setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
+            format.setInteger("vendor.rtc-ext-dec-low-latency.enable", 1)
+        }
+        if (withPriority) {
+            // Real-time priority: the decoder sizes for latency, not throughput.
+            runCatching { format.setInteger(MediaFormat.KEY_PRIORITY, 0) }
+        }
+        if (withOperatingRate) {
+            // Sizes the pipeline for this frame rate instead of batching. Some
+            // decoders refuse it at large sizes (Exynos at 2560x1600@90).
             runCatching { format.setInteger(MediaFormat.KEY_OPERATING_RATE, header.framerate) }
         }
 
@@ -314,8 +380,7 @@ class VideoStream(
             }
         })
 
-        try {
-            // Called when a frame actually reaches the screen, with the clock
+        // Called when a frame actually reaches the screen, with the clock
         // reading from that moment. This is the only honest "displayed" time:
         // releasing the buffer merely schedules it for the next refresh.
         codec.setOnFrameRenderedListener({ _, ptsUs, renderedNs ->
@@ -337,9 +402,21 @@ class VideoStream(
             )
         }, null)
 
-        codec.configure(format, target, null, 0)
+        try {
+            Log.i(TAG, "configure: calling codec.configure() on ${codec.name}, format=$format, surface=$target")
+            codec.configure(format, target, null, 0)
+            Log.i(TAG, "configure: codec.configure() returned OK on ${codec.name}")
             codec.start()
+            Log.i(TAG, "configure: codec.start() returned OK on ${codec.name}")
         } catch (e: Exception) {
+            val detail = if (e is MediaCodec.CodecException) {
+                "CodecException[errorCode=${e.errorCode} " +
+                    "diagnostic=${e.diagnosticInfo} recoverable=${e.isRecoverable} " +
+                    "transient=${e.isTransient}]"
+            } else {
+                "${e.javaClass.simpleName}"
+            }
+            Log.e(TAG, "configure FAILED on ${codec.name}: $detail msg=${e.message} format=$format", e)
             runCatching { codec.release() }
             throw e
         }
